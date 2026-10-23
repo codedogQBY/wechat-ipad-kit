@@ -26,7 +26,9 @@ SRC_DIR="${SRC_DIR:-$PWD/wechat860-src}"
 BASE_IMAGE="${BASE_IMAGE:-ubuntu24:latest}"
 BUILDER_IMAGE="${BUILDER_IMAGE:-wechat-ipad-builder:latest}"
 DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
-GO_VERSION="${GO_VERSION:-1.24.0}"
+# Go 1.24.0 can segfault inside amd64 emulation on Apple Silicon while
+# scanning packages. Use a later 1.24 patch release by default.
+GO_VERSION="${GO_VERSION:-1.24.6}"
 BUILD_MODE="${BUILD_MODE:-auto}"
 ZIG_BIN="${ZIG_BIN:-$(command -v zig || true)}"
 # 默认 0x18005020（≈8.0.80）；实测 8.0.62 会被微信拒绝
@@ -40,8 +42,13 @@ if [ "$BUILD_MODE" = "auto" ]; then
   fi
 fi
 
-if [ -z "$ZIG_BIN" ] && [ -x "$HOME/.cache/wechat-ipad-kit/zig-aarch64-macos-0.14.1/zig" ]; then
+if [ -z "$ZIG_BIN" ] && [ "$(uname -m)" = "arm64" ] \
+  && [ -x "$HOME/.cache/wechat-ipad-kit/zig-aarch64-macos-0.14.1/zig" ]; then
   ZIG_BIN="$HOME/.cache/wechat-ipad-kit/zig-aarch64-macos-0.14.1/zig"
+fi
+if [ -z "$ZIG_BIN" ] && [ "$(uname -m)" = "x86_64" ] \
+  && [ -x "$HOME/.cache/wechat-ipad-kit/zig-x86_64-macos-0.14.1/zig" ]; then
+  ZIG_BIN="$HOME/.cache/wechat-ipad-kit/zig-x86_64-macos-0.14.1/zig"
 fi
 
 [ -f "$SRC_DIR/go.mod" ] || die "找不到源码（${SRC_DIR}）。请先运行 scripts/02-fetch-source.sh"
@@ -107,8 +114,26 @@ title "当前版本号定义"
 grep -nE "IPadVersion = |IPadVersionx = " "$SRC_DIR/Algorithm/Util.go" || true
 grep -nE "ClientVersion = uint32" "$SRC_DIR/baseinfo/basedefine.go" || true
 
+# Rancher Desktop may expose an arm64 VM even when Docker is invoked from
+# Intel macOS. Running the amd64 Go compiler through that emulation is known
+# to crash in the Go runtime; use the already supported host cross build.
+if [ "$BUILD_MODE" = "docker" ] && [ "$(uname -s)" = "Darwin" ] \
+  && [ "$(docker info --format '{{.Architecture}}' 2>/dev/null || true)" = "aarch64" ] \
+  && [ -n "$ZIG_BIN" ]; then
+  warn "Docker 虚拟机是 ARM64，跳过会导致 Go SIGSEGV 的 amd64 仿真编译，改用 macOS 本机交叉编译。"
+  BUILD_MODE="host-cross"
+fi
+
 # --------------------------------------------------------------- 构建器镜像
-if [ "$BUILD_MODE" = "docker" ] && ! docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
+builder_matches_go() {
+  [ "$BUILD_MODE" = "docker" ] || return 1
+  docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1 || return 1
+  docker run --platform "$DOCKER_PLATFORM" --rm "$BUILDER_IMAGE" \
+    bash -lc 'export PATH=/usr/local/go/bin:$PATH; go version' 2>/dev/null \
+    | grep -q "go${GO_VERSION}"
+}
+
+if [ "$BUILD_MODE" = "docker" ] && ! builder_matches_go; then
   title "构建编译环境镜像（首次较慢）"
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
     || die "基础镜像 $BASE_IMAGE 不存在。请先运行 scripts/01-get-base-image.sh"
@@ -132,7 +157,7 @@ RUN go env -w GOPROXY=https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,dir
  && go env -w GOSUMDB=off \\
  && go env -w GOTOOLCHAIN=local
 EOF
-  docker build --platform "$DOCKER_PLATFORM" -t "$BUILDER_IMAGE" "$BUILD_CTX" || die "编译环境镜像构建失败。"
+  docker build --platform "$DOCKER_PLATFORM" --no-cache -t "$BUILDER_IMAGE" "$BUILD_CTX" || die "编译环境镜像构建失败。"
   rm -rf "$BUILD_CTX"
   ok "编译环境就绪: $BUILDER_IMAGE"
 elif docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
@@ -161,6 +186,7 @@ elif [ "$BUILD_MODE" = "docker" ]; then
     -v "$SRC_DIR":/src \
     -w /src \
     -e GOFLAGS=-mod=mod \
+    -e GOMAXPROCS="${BUILD_PROCS:-2}" \
     "$BUILDER_IMAGE" \
     bash -lc 'export PATH=/usr/local/go/bin:$PATH && go build -o main . ' \
     || die "编译失败。请检查上面的 Go 报错信息。"

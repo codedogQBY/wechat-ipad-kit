@@ -3,7 +3,7 @@
 > 微信 iPad 协议 · 可复现部署工具包
 > **把「拿到协议包却跑不起来」的五个坑，变成一条命令。**
 
-[![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue)]()
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-blue)]()
 [![Docker](https://img.shields.io/badge/docker-required-2496ED?logo=docker&logoColor=white)]()
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -44,9 +44,11 @@
 
 ### 环境要求
 
-- Linux x86_64（已在 Ubuntu 22.04 / 24.04 验证）
-- Docker（服务端协议方案**不需要** Windows、微信客户端、图形界面）
-- `redis-server`（或用 Docker 起一个，脚本会提示）
+- macOS（Docker Desktop 或 Rancher Desktop）或 Linux x86_64（Ubuntu 22.04 / 24.04）
+- macOS 上默认用本机 Go + Zig 交叉编译 Linux/amd64 程序；请安装 Go 和 Zig（`brew install zig`）
+- Apple Silicon 运行时仍需要 Docker 支持 `linux/amd64` 仿真；本机 Rancher Desktop QEMU 已验证可以运行交叉编译后的服务
+- Docker Engine 必须已启动；Redis 会作为 Docker 容器启动
+- 服务端协议方案**不需要** Windows、微信客户端或图形界面
 - 约 3GB 磁盘、1GB 内存
 
 ### 一条命令
@@ -62,7 +64,7 @@ bash run.sh
 ```
 [1/5] 下载 Ubuntu 24.04 rootfs  → docker import   （绕开 Docker Hub）
 [2/5] 拉取协议源码                                 （走加速代理）
-[3/5] 注入版本号 + 容器内编译                       （解决 GLIBC + -106）
+[3/5] 注入版本号 + 编译 Linux/amd64                  （macOS 本机交叉编译 / Linux 容器编译）
 [4/5] 启动服务 → 出二维码 → 你扫码 → 自动确认登录    （解决 CheckQR）
 [5/5] 健康检查                                     （判据：Uin/Wxid/Sessionkey）
 ```
@@ -105,6 +107,10 @@ bash run.sh --check
 | `HOST_PORT` | `8058` | 服务端口 |
 | `REDIS_DB` | `2` | 登录态存放的 Redis 库号 |
 | `CONTAINER` | `wechat-ipad` | 容器名 |
+| `DOCKER_PLATFORM` | `linux/amd64` | 协议服务容器平台；Apple Silicon 通过 Docker 仿真运行 |
+| `BUILD_MODE` | `auto` | `auto`、`host-cross`（macOS + Zig）或 `docker` |
+| `ZIG_BIN` | `zig` | Zig 可执行文件路径；本机交叉编译时使用 |
+| `DOCKER_NETWORK` | `wechat-ipad-net` | 协议服务与 Redis 共用的 Docker 网络 |
 | `BASE_IMAGE` | `ubuntu24:latest` | 基础镜像标签 |
 | `BUILDER_IMAGE` | `wechat-ipad-builder:latest` | 编译环境镜像标签 |
 
@@ -113,6 +119,25 @@ bash run.sh --check
 ```bash
 WECHAT_VER=0x18005620 bash run.sh --from 3
 ```
+
+---
+
+## 斗地主机器人
+
+`bot/` 将 `doudizhu-master` 的斗地主规则接入当前 iPad 协议服务：复用已登录会话，通过本机 HTTP API 同步群消息和发送文本，不会再创建 Wechaty 登录或 Docker 容器。
+
+启动前确认 `bash scripts/05-verify.sh` 显示已登录，然后将输出的 Wxid 设置给机器人：
+
+```bash
+cd bot && nvm use && cd ..
+WECHAT_WXID=wxid_你的账号 npm --prefix bot start
+```
+
+若服务端地址或路由前缀不同，可设置 `IPAD_API_URL`（默认 `http://127.0.0.1:8058`）和 `IPAD_API_PREFIX`（默认读取 `.state/prefix.txt`，缺省为 `/api`）。`WECHAT_BOT_NAME` 可手动指定群内机器人的昵称，`BOT_POLL_INTERVAL_MS` 可调整消息同步间隔（默认 1500 毫秒）。Node.js 需要 20 或更新版本。
+
+机器人启动后，在已加入机器人的群聊中 @它发送“斗地主”创建游戏；其他玩家 @它发送“上桌”，随后按群内提示抢地主和出牌。机器人需要能够向玩家私聊，以发送手牌。请将协议服务 API 保持在本机回环地址，不要直接暴露到公网。
+
+游戏胜率和摸鱼记录保存在 `bot/data/`，不会覆盖下载目录原项目中的记录文件。
 
 ---
 
@@ -201,7 +226,7 @@ wechat-ipad-kit/
 │   ├── lib/common.sh           # 公共函数（日志/下载/版本比较）
 │   ├── 01-get-base-image.sh    # ① 绕开 Docker Hub
 │   ├── 02-fetch-source.sh      # ② 获取源码
-│   ├── 03-build.sh             # ③ 版本号注入 + 容器内编译
+│   ├── 03-build.sh             # ③ 版本号注入 + Linux/amd64 编译
 │   ├── 04-login.sh             # ④ 扫码 + 显式确认登录
 │   └── 05-verify.sh            # ⑤ 健康检查
 ├── docs/
@@ -215,15 +240,16 @@ wechat-ipad-kit/
 ## 原理简述
 
 **为什么用 Ubuntu 24.04 容器？**
-协议内核是闭源预编译的，需要 GLIBC ≥ 2.38。宿主（如 22.04）只有 2.35，
-而升级宿主影响面太大。用容器隔离既满足依赖，又不污染宿主。
+协议内核是闭源预编译的，需要 GLIBC ≥ 2.38。用 Ubuntu 24.04 容器运行可以满足依赖，
+也不需要改动 macOS 宿主。
 
 **为什么要改版本号？**
 微信服务端校验客户端版本，过低直接拒绝（`-106`）。
 改版本号后从头编译，产物即携带新版本号。
 
-**为什么编译要在容器里？**
-这样产物链接的是容器内的新 glibc，宿主再旧也不影响。
+**为什么 macOS 上用 Zig 交叉编译？**
+Go 工具链在 Apple Silicon 的 QEMU 容器中可能崩溃。macOS 本机用 Go + Zig 生成 Linux/amd64
+程序，运行时再放进 Ubuntu 24.04 容器；Linux 主机仍使用原来的容器内编译流程。
 
 **为什么不用 docker pull？**
 国内对 Docker Hub 及多数加速器访问不稳定，且部分加速器对

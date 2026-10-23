@@ -1,0 +1,13 @@
+{
+  "name": "wechat-ipad-doudizhu-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "斗地主机器人，使用 wechat-ipad-kit 的已登录会话",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -21,11 +21,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SRC_DIR="${SRC_DIR:-$PWD/wechat860-src}"
 BUILDER_IMAGE="${BUILDER_IMAGE:-wechat-ipad-builder:latest}"
+BASE_IMAGE="${BASE_IMAGE:-ubuntu24:latest}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 CONTAINER="${CONTAINER:-wechat-ipad}"
+REDIS_CONTAINER="${REDIS_CONTAINER:-wechat-redis}"
+DOCKER_NETWORK="${DOCKER_NETWORK:-wechat-ipad-net}"
 HOST_PORT="${HOST_PORT:-8058}"
+CONTAINER_PORT="${CONTAINER_PORT:-8058}"
 REDIS_DB="${REDIS_DB:-2}"
 STATE_DIR="${STATE_DIR:-$PWD/.state}"
 LOG_FILE="${LOG_FILE:-$PWD/wechat-ipad.log}"
+RUNTIME_IMAGE="${RUNTIME_IMAGE:-$BUILDER_IMAGE}"
+VERIFIED_WXID=""
+
+if ! docker image inspect "$RUNTIME_IMAGE" >/dev/null 2>&1; then
+  RUNTIME_IMAGE="$BASE_IMAGE"
+fi
 
 mkdir -p "$STATE_DIR"
 UUID_FILE="$STATE_DIR/uuid.txt"
@@ -35,22 +46,28 @@ require_cmd curl   "请先安装 curl。"
 
 # --------------------------------------------------------------- 依赖：Redis
 ensure_redis() {
-  if has_cmd redis-cli && redis-cli ping >/dev/null 2>&1; then
-    ok "Redis 可用"
+  docker network inspect "$DOCKER_NETWORK" >/dev/null 2>&1 || docker network create "$DOCKER_NETWORK" >/dev/null
+
+  if docker container inspect "$REDIS_CONTAINER" >/dev/null 2>&1; then
+    docker start "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+    docker network connect "$DOCKER_NETWORK" "$REDIS_CONTAINER" >/dev/null 2>&1 || true
+  elif confirm "现在用 Docker 启动 Redis?"; then
+    docker run -d --name "$REDIS_CONTAINER" --network "$DOCKER_NETWORK" \
+      --restart unless-stopped redis:7-alpine >/dev/null
+  else
+    warn "未启动 Redis；登录流程需要 Redis 才能保存登录态。"
     return 0
   fi
-  warn "本机未检测到可用 Redis。"
-  log  "协议实现依赖 Redis 存放登录缓存。可选："
-  log  "  a) 安装: sudo apt-get install -y redis-server && sudo systemctl start redis-server"
-  log  "  b) 用 Docker: docker run -d --name wechat-redis -p 6379:6379 redis:7-alpine"
-  if has_cmd docker; then
-    if confirm "现在用 Docker 起一个 Redis?"; then
-      docker rm -f wechat-redis >/dev/null 2>&1 || true
-      docker run -d --name wechat-redis -p 6379:6379 --restart unless-stopped redis:7-alpine >/dev/null
-      sleep 2
-      has_cmd redis-cli && redis-cli ping >/dev/null 2>&1 && ok "Redis 已启动" || warn "Redis 启动后仍无法连接，请自行处理"
+
+  local _i
+  for _i in $(seq 1 10); do
+    if redis_cli ping 2>/dev/null | grep -qx PONG; then
+      ok "Docker Redis 可用"
+      return 0
     fi
-  fi
+    sleep 1
+  done
+  warn "Redis 容器未就绪，请查看: docker logs $REDIS_CONTAINER"
 }
 
 # ------------------------------------------------------------- 启动（幂等）
@@ -58,17 +75,23 @@ start_service() {
   title "在容器内启动协议服务"
   [ -x "$SRC_DIR/main" ] || die "找不到可执行文件 $SRC_DIR/main。请先运行 scripts/03-build.sh"
 
+  if [ -f "$SRC_DIR/conf/app.conf" ]; then
+    sed_in_place "s|^redislink = .*|redislink = \"$REDIS_CONTAINER:6379\"|" "$SRC_DIR/conf/app.conf"
+    sed_in_place "s|^redisdbnum = .*|redisdbnum = $REDIS_DB|" "$SRC_DIR/conf/app.conf"
+  fi
+
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
   # 关键：把 libv08.so / libz.so 所在目录注册进动态链接器搜索路径
   #      并额外设置 LD_LIBRARY_PATH 双保险
-  docker run -d --name "$CONTAINER" \
-    --network host \
+  docker run --platform "$DOCKER_PLATFORM" -d --name "$CONTAINER" \
+    --network "$DOCKER_NETWORK" \
+    -p "$HOST_PORT:$CONTAINER_PORT" \
     --restart unless-stopped \
     -v "$SRC_DIR":/src \
     -w /src \
     -e LD_LIBRARY_PATH=/src/lib \
-    "$BUILDER_IMAGE" \
+    "$RUNTIME_IMAGE" \
     bash -c "echo '/src/lib' > /etc/ld.so.conf.d/wechat.conf && ldconfig && cd /src && exec ./main" \
     >/dev/null
 
@@ -86,27 +109,29 @@ start_service() {
     log  "排查：确认 lib/libv08.so 存在，且容器内 ldconfig 已注册该目录。"
   fi
 
-  ss -tlnp 2>/dev/null | grep -q ":$HOST_PORT " \
+  curl -fsS -o /dev/null -m 2 "http://127.0.0.1:$HOST_PORT/" 2>/dev/null \
     && ok "服务已监听 $HOST_PORT" \
-    || warn "未检测到端口 $HOST_PORT，请查看容器日志: docker logs $CONTAINER"
+    || warn "未检测到端口 ${HOST_PORT}，请查看容器日志: docker logs $CONTAINER"
 }
 
 # ------------------------------------------------------------- 探测路由前缀
 # 不同构建的 URL 前缀不同，靠探测确定，而不是猜
 detect_prefix() {
   if [ -f "$STATE_DIR/prefix.txt" ]; then
-    cat "$STATE_DIR/prefix.txt"; return 0
+    API_PREFIX="$(cat "$STATE_DIR/prefix.txt")"
+    return 0
   fi
   title "探测 API 路由前缀"
   local p code
   for p in "/api" "" "/VXAPI" "/v1" "/v2"; do
     code="$(curl -s -o /dev/null -w '%{http_code}' -m 15 -X POST \
             "http://127.0.0.1:$HOST_PORT$p/Login/LoginGetQR" \
-            -H 'Content-Type: application/json' -d '{"DeviceName":"iPad"}' 2>/dev/null || echo 000)"
+            -H 'Content-Type: application/json' -d '{"DeviceName":"iPad"}' 2>/dev/null || true)"
+    [ -n "$code" ] || code=000
     if [ "$code" = "200" ]; then
       ok "前缀 = '${p:-（无）}'"
       printf '%s' "$p" > "$STATE_DIR/prefix.txt"
-      printf '%s' "$p"
+      API_PREFIX="$p"
       return 0
     fi
     info "前缀 '${p:-（无）}' → HTTP $code"
@@ -163,7 +188,7 @@ except Exception:
                              errors='replace').read()[:300])
     sys.exit(2)
 
-    data = r.get('Data') or {}
+data = r.get('Data') or {}
 br   = data.get('baseResponse') or {}
 ret  = br.get('ret')
 msg  = ((br.get('errMsg') or {}).get('string') or '')
@@ -180,7 +205,7 @@ if ret == -106:
     print("  >>> 应用版本过低。请提高版本号后重新编译：")
     print("      WECHAT_VER=0x18005620 bash scripts/03-build.sh   # ≈8.0.86")
     sys.exit(1)
-if ret == 0 and r.get('Success'):
+if r.get('Code') == 0 and r.get('Success') and ret == 0:
     print()
     print("  >>> 微信已接受登录")
     sys.exit(0)
@@ -190,29 +215,34 @@ PY
 
 # ------------------------------------------------------------------ 校验登录态
 verify_state() {
+  local login_started_at="$1"
   title "校验登录态（权威判据）"
-  if ! has_cmd redis-cli; then
-    warn "缺少 redis-cli，跳过自动校验。请自行检查 Redis DB $REDIS_DB。"
+  if ! redis_cli ping >/dev/null 2>&1; then
+    warn "Docker Redis 不可用，跳过自动校验。请检查容器 ${REDIS_CONTAINER}。"
     return 2
   fi
   local found=0
   local key
-  for key in $(redis-cli -n "$REDIS_DB" --scan 2>/dev/null | grep -vE '^(wechat|devId):'); do
+  VERIFIED_WXID=""
+  for key in $(redis_cli -n "$REDIS_DB" --scan 2>/dev/null | grep -vE '^(wechat|devId):'); do
     local out
-    out="$(redis-cli -n "$REDIS_DB" GET "$key" 2>/dev/null | python3 -c '
+    out="$(redis_cli -n "$REDIS_DB" GET "$key" 2>/dev/null | python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(0)
 uin=d.get("Uin") or 0
 wxid=d.get("Wxid") or ""
 sk=d.get("Sessionkey")
-if uin and wxid and sk is not None:
-    print(f"OK|{wxid}|{uin}")
-' 2>/dev/null)"
+login_date=int(d.get("LoginDate") or 0)
+since=int(sys.argv[1])
+if uin and wxid and sk is not None and login_date >= since:
+    print(f"OK|{wxid}|{uin}|{login_date}")
+' "$login_started_at" 2>/dev/null)"
     if [ -n "$out" ]; then
       found=1
-      log "  ✅ 登录成功"
-      log "     Wxid : $(echo "$out" | cut -d'|' -f2)"
+      VERIFIED_WXID="$(echo "$out" | cut -d'|' -f2)"
+      log "  ✅ 本次扫码后的登录态已写入"
+      log "     Wxid : $VERIFIED_WXID"
       log "     Uin  : $(echo "$out" | cut -d'|' -f3)"
       log "     Redis DB$REDIS_DB key: $key"
     fi
@@ -222,13 +252,34 @@ if uin and wxid and sk is not None:
   return 1
 }
 
+verify_live_session() {
+  title "验证微信侧会话"
+  local resp code
+  resp="$(curl -sS -m 30 -X POST \
+    "http://127.0.0.1:$HOST_PORT$API_PREFIX/User/GetContractProfile?wxid=$VERIFIED_WXID" \
+    -H 'Content-Type: application/json' -d '{}' 2>/dev/null || echo '{}')"
+  code="$(printf '%s' "$resp" | python3 -c '
+import json,sys
+try: print(json.load(sys.stdin).get("Code"))
+except Exception: print("?")
+' 2>/dev/null)"
+  if [ "$code" = "0" ]; then
+    ok "微信侧会话有效"
+    return 0
+  fi
+  warn "微信侧会话未通过验证（Code $code）；Redis 中仍可能保留登录字段"
+  return 1
+}
+
 # ================================================================== 主流程
 main() {
   require_cmd python3 "解析二维码需要 python3。"
   ensure_redis
   start_service
 
-  local prefix; prefix="$(detect_prefix)"
+  detect_prefix
+  local prefix="$API_PREFIX"
+  local login_started_at; login_started_at="$(date +%s)"
   get_qr "$prefix"
 
   local uuid; uuid="$(cat "$UUID_FILE" 2>/dev/null || echo '')"
@@ -245,13 +296,19 @@ main() {
   printf '%s' "$C_RESET"
   read -r _
 
-  confirm_login "$prefix" "$uuid" || true
+  if ! confirm_login "$prefix" "$uuid"; then
+    die "二维码确认未成功。请确认手机端已点【确认登录】；旧 Redis 登录记录不代表本次登录成功。"
+  fi
 
   # 扫码后等一下再查，给服务端一点写入时间
   sleep 2
-  if verify_state; then
+  if verify_state "$login_started_at" && verify_live_session; then
     title "完成"
     log "登录态已建立，可继续: bash scripts/05-verify.sh"
+  elif [ -n "$VERIFIED_WXID" ]; then
+    title "微信会话不可用"
+    log "扫码接口接受了登录，但微信侧请求未通过验证。不要启动机器人；请检查手机端是否撤销了 iPad 登录，再尝试重新扫码。"
+    exit 1
   else
     title "尚未登录"
     log "常见原因："

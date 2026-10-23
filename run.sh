@@ -36,10 +36,10 @@ fi
 
 STEPS=(
   "01-get-base-image.sh|获取 Ubuntu 24.04 基础镜像（绕开 Docker Hub）"
-  "02-fetch-source.sh  |获取协议源码"
-  "03-build.sh         |注入版本号 + 容器内编译"
-  "04-login.sh         |启动服务 + 扫码登录（含显式确认）"
-  "05-verify.sh        |健康检查"
+  "02-fetch-source.sh|获取协议源码"
+  "03-build.sh|注入版本号 + 编译 Linux/amd64"
+  "04-login.sh|启动服务 + 扫码登录（含显式确认）"
+  "05-verify.sh|健康检查"
 )
 
 printf '%s' "$C_BOLD"
@@ -49,7 +49,8 @@ cat <<'BANNER'
 ║                                                              ║
 ║  把「拿到协议包却跑不起来」的常见障碍自动化处理：            ║
 ║    · Docker Hub 被墙      → 走 Ubuntu 官方 rootfs            ║
-║    · GLIBC 版本过低       → 全程在 Ubuntu 24.04 容器内编译   ║
+║    · Apple Silicon 编译   → Mac 本机 Go + Zig 交叉编译       ║
+║    · Linux GLIBC 依赖      → Ubuntu 24.04 容器运行             ║
 ║    · 协议内核 .so 加载失败 → 自动注册动态库路径              ║
 ║    · 微信报「版本过低」   → 自动注入新版客户端版本号         ║
 ║    · 扫码后登录不完成     → 自动执行显式确认调用             ║
@@ -66,10 +67,11 @@ for s in "${STEPS[@]}"; do
     continue
   fi
   title "步骤 $i/5  $desc"
-  bash "$HERE/scripts/$file" || {
-    rc=$?
-    die "步骤 $i 失败（退出码 $rc）。修复后可用 --from $i 从这一步继续。"
-  }
+  if bash "$HERE/scripts/$file"; then
+    :
+  else
+    die "步骤 $i 失败。修复后可用 --from $i 从这一步继续。"
+  fi
 done
 
 title "全部完成 🎉"

@@ -14,6 +14,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SRC_DIR="${SRC_DIR:-$PWD/wechat860-src}"
 CONTAINER="${CONTAINER:-wechat-ipad}"
+REDIS_CONTAINER="${REDIS_CONTAINER:-wechat-redis}"
 HOST_PORT="${HOST_PORT:-8058}"
 REDIS_DB="${REDIS_DB:-2}"
 STATE_DIR="${STATE_DIR:-$PWD/.state}"
@@ -50,35 +51,39 @@ if curl -fsS -o /dev/null -m 5 "http://127.0.0.1:$HOST_PORT/" 2>/dev/null; then
   ok "HTTP $HOST_PORT 可访问"
 else
   # 有些构建根路径返回 404，但接口仍可用
-  code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$HOST_PORT/" 2>/dev/null || echo 000)"
-  if [ "$code" != "000" ]; then ok "端口有响应（HTTP $code）"; else warn "端口无响应"; mark_fail; fi
+  code="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$HOST_PORT/" 2>/dev/null || true)"
+  [ -n "$code" ] || code=000
+  if [ "$code" != "000" ]; then ok "端口有响应（HTTP ${code}）"; else warn "端口无响应"; mark_fail; fi
 fi
 
 # ------------------------------------------------------------------ 4. Redis
 title "4/5  Redis 登录缓存"
-if has_cmd redis-cli && redis-cli ping >/dev/null 2>&1; then
-  n="$(redis-cli -n "$REDIS_DB" DBSIZE 2>/dev/null || echo '?')"
-  ok "Redis 可用，DB$REDIS_DB 有 $n 个键"
+if redis_cli ping >/dev/null 2>&1; then
+  n="$(redis_cli -n "$REDIS_DB" DBSIZE 2>/dev/null || echo '?')"
+  ok "Docker Redis 可用，DB$REDIS_DB 有 $n 个键"
 else
   warn "Redis 不可用"; mark_fail
 fi
 
 # --------------------------------------------------------------- 5. 登录态
-title "5/5  登录态（权威判据：Uin / Wxid / Sessionkey 三者齐全）"
+title "5/5  Redis 登录缓存字段"
 logged_in=0
-if has_cmd redis-cli; then
-  for key in $(redis-cli -n "$REDIS_DB" --scan 2>/dev/null | grep -vE '^(wechat|devId):'); do
-    out="$(redis-cli -n "$REDIS_DB" GET "$key" 2>/dev/null | python3 -c '
+logged_wxid=""
+if redis_cli ping >/dev/null 2>&1; then
+  for key in $(redis_cli -n "$REDIS_DB" --scan 2>/dev/null | grep -vE '^(wechat|devId):'); do
+    out="$(redis_cli -n "$REDIS_DB" GET "$key" 2>/dev/null | python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(0)
 uin=d.get("Uin") or 0; wxid=d.get("Wxid") or ""; sk=d.get("Sessionkey")
 if uin and wxid and sk is not None:
-    print(f"{wxid}|{uin}|{d.get(chr(78)+chr(105)+chr(99)+chr(107)+chr(78)+chr(97)+chr(109)+chr(101)) or \"\"}")
+    nick=d.get("NickName") or ""
+    print("{}|{}|{}".format(wxid, uin, nick))
 ' 2>/dev/null)"
     if [ -n "$out" ]; then
       logged_in=1
-      ok "已登录"
+      [ -n "$logged_wxid" ] || logged_wxid="$(echo "$out" | cut -d'|' -f1)"
+      ok "缓存字段齐全（尚需验证微信侧会话）"
       log "     Wxid     : $(echo "$out" | cut -d'|' -f1)"
       log "     Uin      : $(echo "$out" | cut -d'|' -f2)"
       log "     NickName : $(echo "$out" | cut -d'|' -f3)"
@@ -92,31 +97,57 @@ if [ "$logged_in" -eq 0 ]; then
 fi
 
 # --------------------------------------------------------------- 接口探测
+session_verified=0
 if [ "$logged_in" -eq 1 ]; then
-  uuid="$(redis-cli -n "$REDIS_DB" --scan 2>/dev/null | grep -vE '^(wechat|devId):' | head -1)"
-  title "接口连通性探测（可选）"
+  title "微信侧会话验证 / 通讯录接口探测"
   for ep in "User/GetContractProfile" "Friend/GetContractList"; do
-    resp="$(curl -sS -m 30 -X POST "http://127.0.0.1:$HOST_PORT$PREFIX/$ep" \
-              -H 'Content-Type: application/json' -d "{\"Key\":\"$uuid\"}" 2>/dev/null || echo '{}')"
+    if [ "$ep" = "User/GetContractProfile" ]; then
+      url="http://127.0.0.1:$HOST_PORT$PREFIX/$ep?wxid=$logged_wxid"
+      body='{}'
+    else
+      url="http://127.0.0.1:$HOST_PORT$PREFIX/$ep"
+      body="{\"Wxid\":\"$logged_wxid\",\"CurrentWxcontactSeq\":0,\"CurrentChatRoomContactSeq\":0}"
+    fi
+    resp="$(curl -sS -m 30 -X POST "$url" \
+              -H 'Content-Type: application/json' -d "$body" 2>/dev/null || echo '{}')"
     code="$(printf '%s' "$resp" | python3 -c '
 import json,sys
 try:
     d=json.load(sys.stdin); print(d.get("Code"))
 except Exception: print("?")
 ' 2>/dev/null)"
-    if [ "$code" = "0" ]; then ok "$ep  → Code 0"
-    else warn "$ep  → Code $code"; fi
+    if [ "$ep" = "User/GetContractProfile" ]; then
+      if [ "$code" = "0" ]; then
+        session_verified=1
+        ok "$ep  → Code 0（微信侧会话有效）"
+      elif [ "$code" = "-13" ]; then
+        warn "$ep  → Code -13（协议会话已超时，需要重新扫码登录）"
+        mark_fail
+      else
+        warn "$ep  → Code $code（无法确认微信侧会话）"
+        mark_fail
+      fi
+    elif [ "$code" = "0" ]; then
+      ok "$ep  → Code 0"
+    elif [ "$code" = "-13" ]; then
+      warn "$ep  → Code -13（协议会话已超时，需要重新扫码登录）"
+      mark_fail
+    else
+      warn "$ep  → Code $code"
+    fi
   done
 fi
 
 # ------------------------------------------------------------------ 总结
 echo
-if [ "$fails" -eq 0 ] && [ "$logged_in" -eq 1 ]; then
+if [ "$fails" -eq 0 ] && [ "$logged_in" -eq 1 ] && [ "$session_verified" -eq 1 ]; then
   ok "全部检查通过 ✅"
   exit 0
 fi
 if [ "$logged_in" -eq 0 ]; then
   warn "存在 $fails 项异常（登录态未建立）"
+elif [ "$session_verified" -eq 0 ]; then
+  warn "Redis 中有登录缓存，但微信侧会话未验证"
 else
   warn "存在 $fails 项异常"
 fi
@@ -126,6 +157,10 @@ log "容器日志末尾："
 docker logs --tail 20 "$CONTAINER" 2>&1 | sed 's/^/  /' || true
 log "磁盘 / 内存："
 df -h . 2>/dev/null | tail -1 | sed 's/^/  /' || true
-free -m 2>/dev/null | head -2 | sed 's/^/  /' || true
+if has_cmd free; then
+  free -m 2>/dev/null | head -2 | sed 's/^/  /' || true
+elif has_cmd vm_stat; then
+  vm_stat 2>/dev/null | sed -n '1,3p' | sed 's/^/  /' || true
+fi
 log "详见 docs/TROUBLESHOOTING.md"
 exit 1

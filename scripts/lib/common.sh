@@ -37,7 +37,27 @@ glibc_version() {
 }
 
 # 版本比较：ver_ge 2.39 2.38  → true
-ver_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+ver_ge() {
+  awk -v left="$1" -v right="$2" 'BEGIN {
+    n = split(left, a, "."); m = split(right, b, ".")
+    count = n > m ? n : m
+    for (i = 1; i <= count; i++) {
+      x = a[i] + 0; y = b[i] + 0
+      if (x > y) exit 0
+      if (x < y) exit 1
+    }
+    exit 0
+  }'
+}
+
+file_size_bytes() { wc -c < "$1" | tr -d '[:space:]'; }
+
+sed_in_place() {
+  local expression="$1" file="$2" temporary="${2}.tmp"
+  sed -E "$expression" "$file" > "$temporary" && mv "$temporary" "$file"
+}
+
+redis_cli() { docker exec "${REDIS_CONTAINER:-wechat-redis}" redis-cli "$@"; }
 
 # ---------------------------------------------------------------- 下载辅助
 # 依次尝试多个 URL 前缀（用于绕过 GitHub 直连问题）

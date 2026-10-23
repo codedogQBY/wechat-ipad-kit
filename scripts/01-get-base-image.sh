@@ -17,6 +17,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/common.sh"
 
 IMAGE_TAG="${IMAGE_TAG:-ubuntu24:latest}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/wechat-ipad-kit}"
 ROOTFS="$CACHE_DIR/noble-rootfs.tar.xz"
 MIN_SIZE=150000000          # 约 150MB，小于此值说明下载不完整
@@ -28,7 +29,7 @@ require_cmd curl   "请先安装 curl。"
 # --------------------------------------------------------------- 幂等检查
 if docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   ok "基础镜像 $IMAGE_TAG 已存在，跳过。"
-  glibc_in_image="$(docker run --rm "$IMAGE_TAG" bash -c 'ldd --version | head -1' 2>/dev/null || echo '未知')"
+  glibc_in_image="$(docker run --platform "$DOCKER_PLATFORM" --rm "$IMAGE_TAG" bash -c 'ldd --version | head -1' 2>/dev/null || echo '未知')"
   info "镜像内 glibc: $glibc_in_image"
   exit 0
 fi
@@ -43,7 +44,7 @@ SOURCES=(
   "https://mirrors.aliyun.com/ubuntu-cloud-images/noble/current/noble-server-cloudimg-amd64-root.tar.xz"
 )
 
-if [ -f "$ROOTFS" ] && [ "$(stat -c%s "$ROOTFS" 2>/dev/null || echo 0)" -gt "$MIN_SIZE" ]; then
+if [ -f "$ROOTFS" ] && [ "$(file_size_bytes "$ROOTFS")" -gt "$MIN_SIZE" ]; then
   ok "已存在可用缓存: $ROOTFS"
 else
   rm -f "$ROOTFS"
@@ -51,17 +52,17 @@ else
     || die "所有镜像源均下载失败。请检查网络，或手动下载 rootfs 放到 $ROOTFS"
 fi
 
-actual="$(stat -c%s "$ROOTFS")"
+actual="$(file_size_bytes "$ROOTFS")"
 [ "$actual" -ge "$MIN_SIZE" ] || die "下载文件过小（$actual 字节），可能不完整，请删除后重试。"
 ok "rootfs 就绪：$((actual / 1024 / 1024)) MB"
 
 title "导入为 Docker 镜像：$IMAGE_TAG"
-docker import "$ROOTFS" "$IMAGE_TAG"
+docker import --platform "$DOCKER_PLATFORM" "$ROOTFS" "$IMAGE_TAG"
 docker image inspect "$IMAGE_TAG" >/dev/null 2>&1 || die "docker import 后仍找不到镜像。"
 
 # --------------------------------------------------------------- 验证 GLIBC
 title "验证 GLIBC 版本（关键）"
-image_glibc="$(docker run --rm "$IMAGE_TAG" bash -c 'ldd --version | head -1 | grep -oE "[0-9]+\.[0-9]+$"')"
+image_glibc="$(docker run --platform "$DOCKER_PLATFORM" --rm "$IMAGE_TAG" bash -c 'ldd --version | head -1 | grep -oE "[0-9]+\.[0-9]+$"')"
 info "镜像内 GLIBC = $image_glibc"
 
 if ver_ge "$image_glibc" "2.38"; then

@@ -24,7 +24,7 @@ has_cmd unzip || warn "未找到 unzip，稍后可能需要安装。"
 
 # --------------------------------------------------------------- 幂等检查
 if [ -f "$SRC_DIR/go.mod" ] && [ -d "$SRC_DIR/baseinfo" ]; then
-  ok "源码已存在: $SRC_DIR，跳过下载。"
+  ok "源码已存在: ${SRC_DIR}，跳过下载。"
   log "如需重新拉取，请先删除该目录。"
   exit 0
 fi

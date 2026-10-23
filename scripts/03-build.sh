@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  步骤 3/5 :: 注入版本号 + 容器内编译
+#  步骤 3/5 :: 注入版本号 + 编译 Linux/amd64
 #
 #  解决什么：
-#    ① 宿主 GLIBC 太旧 → 全程在 Ubuntu24 容器里编译，产物链接容器内的新 glibc。
+#    ① 协议库需要较新 GLIBC → 在 Ubuntu 24.04 容器内运行。
 #    ② 微信服务端返回 -106「你的应用版本过低」→ 编译前把客户端版本号改新。
-#    ③ libv08.so / libz.so 找不到 → 装进容器后用 ldconfig 注册。
+#    ③ Apple Silicon 容器内 Go 编译易受 QEMU 影响 → macOS 本机用 Zig 交叉编译。
+#    ④ libv08.so / libz.so 找不到 → 启动容器时设置 LD_LIBRARY_PATH。
 #
 #  版本号规则（iOS 系）：
 #    形如 0x18 00 3E 20
@@ -24,11 +25,26 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC_DIR="${SRC_DIR:-$PWD/wechat860-src}"
 BASE_IMAGE="${BASE_IMAGE:-ubuntu24:latest}"
 BUILDER_IMAGE="${BUILDER_IMAGE:-wechat-ipad-builder:latest}"
+DOCKER_PLATFORM="${DOCKER_PLATFORM:-linux/amd64}"
 GO_VERSION="${GO_VERSION:-1.24.0}"
+BUILD_MODE="${BUILD_MODE:-auto}"
+ZIG_BIN="${ZIG_BIN:-$(command -v zig || true)}"
 # 默认 0x18005020（≈8.0.80）；实测 8.0.62 会被微信拒绝
 WECHAT_VER="${WECHAT_VER:-0x18005020}"
 
-[ -f "$SRC_DIR/go.mod" ] || die "找不到源码（$SRC_DIR）。请先运行 scripts/02-fetch-source.sh"
+if [ "$BUILD_MODE" = "auto" ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    BUILD_MODE="host-cross"
+  else
+    BUILD_MODE="docker"
+  fi
+fi
+
+if [ -z "$ZIG_BIN" ] && [ -x "$HOME/.cache/wechat-ipad-kit/zig-aarch64-macos-0.14.1/zig" ]; then
+  ZIG_BIN="$HOME/.cache/wechat-ipad-kit/zig-aarch64-macos-0.14.1/zig"
+fi
+
+[ -f "$SRC_DIR/go.mod" ] || die "找不到源码（${SRC_DIR}）。请先运行 scripts/02-fetch-source.sh"
 
 title "注入客户端版本号: $WECHAT_VER"
 
@@ -44,7 +60,7 @@ info "对应版本约为 $human_ver"
 # 备份 + 原地替换（幂等：重复执行也安全）
 patch_ver() {
   local file="$1" pattern="$2" desc="$3"
-  [ -f "$SRC_DIR/$file" ] || { warn "跳过 $file（不存在）"; return 0; }
+  [ -f "$SRC_DIR/$file" ] || { warn "跳过 ${file}（不存在）"; return 0; }
   [ -f "$SRC_DIR/$file.orig" ] || cp "$SRC_DIR/$file" "$SRC_DIR/$file.orig"
   # 用 .orig 作基准，保证多次执行结果一致
   if sed -E "s|${pattern}|var \3 = ${4:-int32}($WECHAT_VER) // patched|" \
@@ -56,14 +72,20 @@ patch_ver() {
 }
 
 # IPadVersion / IPadVersionx —— 二维码与登录流程实际使用的版本号
-sed -E "s|var IPadVersion = int32\(0x[0-9A-Fa-f]+\)[^\n]*|var IPadVersion = int32($WECHAT_VER) // patched|" \
-    "$SRC_DIR/Algorithm/Util.go.orig" 2>/dev/null >/dev/null || cp "$SRC_DIR/Algorithm/Util.go" "$SRC_DIR/Algorithm/Util.go.orig"
-sed -E -i "s|var IPadVersion = int32\(0x[0-9A-Fa-f]+\)[^\n]*|var IPadVersion = int32($WECHAT_VER) // patched|" "$SRC_DIR/Algorithm/Util.go"
-sed -E -i "s|var IPadVersionx = int32\(0x[0-9A-Fa-f]+\)[^\n]*|var IPadVersionx = int32($WECHAT_VER) // patched|" "$SRC_DIR/Algorithm/Util.go"
+[ -f "$SRC_DIR/Algorithm/Util.go.orig" ] || cp "$SRC_DIR/Algorithm/Util.go" "$SRC_DIR/Algorithm/Util.go.orig"
+sed -E \
+  -e "s|var IPadVersion = int32\(0x[0-9A-Fa-f]+\).*|var IPadVersion = int32($WECHAT_VER) // patched|" \
+  -e "s|var IPadVersionx = int32\(0x[0-9A-Fa-f]+\).*|var IPadVersionx = int32($WECHAT_VER) // patched|" \
+  "$SRC_DIR/Algorithm/Util.go.orig" > "$SRC_DIR/Algorithm/Util.go.tmp"
+mv "$SRC_DIR/Algorithm/Util.go.tmp" "$SRC_DIR/Algorithm/Util.go"
 ok "Algorithm/Util.go"
 
-sed -E -i "s|var ClientVersion = uint32\(0x[0-9A-Fa-f]+\)[^\n]*|var ClientVersion = uint32($WECHAT_VER) // patched|" "$SRC_DIR/baseinfo/basedefine.go"
-sed -E -i "s|var PlistVersion = uint32\(0x[0-9A-Fa-f]+\)[^\n]*|var PlistVersion = uint32($WECHAT_VER) // patched|" "$SRC_DIR/baseinfo/basedefine.go"
+[ -f "$SRC_DIR/baseinfo/basedefine.go.orig" ] || cp "$SRC_DIR/baseinfo/basedefine.go" "$SRC_DIR/baseinfo/basedefine.go.orig"
+sed -E \
+  -e "s|var ClientVersion = uint32\(0x[0-9A-Fa-f]+\).*|var ClientVersion = uint32($WECHAT_VER) // patched|" \
+  -e "s|var PlistVersion = uint32\(0x[0-9A-Fa-f]+\).*|var PlistVersion = uint32($WECHAT_VER) // patched|" \
+  "$SRC_DIR/baseinfo/basedefine.go.orig" > "$SRC_DIR/baseinfo/basedefine.go.tmp"
+mv "$SRC_DIR/baseinfo/basedefine.go.tmp" "$SRC_DIR/baseinfo/basedefine.go"
 ok "baseinfo/basedefine.go"
 
 title "当前版本号定义"
@@ -71,7 +93,7 @@ grep -nE "IPadVersion = |IPadVersionx = " "$SRC_DIR/Algorithm/Util.go" || true
 grep -nE "ClientVersion = uint32" "$SRC_DIR/baseinfo/basedefine.go" || true
 
 # --------------------------------------------------------------- 构建器镜像
-if ! docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
+if [ "$BUILD_MODE" = "docker" ] && ! docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
   title "构建编译环境镜像（首次较慢）"
   docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 \
     || die "基础镜像 $BASE_IMAGE 不存在。请先运行 scripts/01-get-base-image.sh"
@@ -81,11 +103,6 @@ if ! docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
 FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PATH=/usr/local/go/bin:\$PATH
-
-# 换国内 apt 源（失败不影响后续，保留原源即可）
-RUN sed -i 's@//archive.ubuntu.com@//mirrors.aliyun.com@g; \\
-            s@//security.ubuntu.com@//mirrors.aliyun.com@g' \\
-        /etc/apt/sources.list.d/ubuntu.sources 2>/dev/null || true
 
 RUN apt-get update -qq && \\
     apt-get install -y -qq ca-certificates curl xz-utils git gcc g++ libc6-dev >/dev/null
@@ -100,24 +117,51 @@ RUN go env -w GOPROXY=https://goproxy.cn,https://mirrors.aliyun.com/goproxy/,dir
  && go env -w GOSUMDB=off \\
  && go env -w GOTOOLCHAIN=local
 EOF
-  docker build -t "$BUILDER_IMAGE" "$BUILD_CTX" || die "编译环境镜像构建失败。"
+  docker build --platform "$DOCKER_PLATFORM" -t "$BUILDER_IMAGE" "$BUILD_CTX" || die "编译环境镜像构建失败。"
   rm -rf "$BUILD_CTX"
   ok "编译环境就绪: $BUILDER_IMAGE"
-else
+elif docker image inspect "$BUILDER_IMAGE" >/dev/null 2>&1; then
   ok "编译环境已存在: $BUILDER_IMAGE"
 fi
 
 # --------------------------------------------------------------- 编译
-title "容器内编译（首次会拉取大量 Go 依赖）"
-docker run --rm \
-  -v "$SRC_DIR":/src \
-  -w /src \
-  -e GOFLAGS=-mod=mod \
-  "$BUILDER_IMAGE" \
-  bash -lc 'export PATH=/usr/local/go/bin:$PATH && go build -o main . ' \
-  || die "编译失败。请检查上面的 Go 报错信息。"
+if [ "$BUILD_MODE" = "host-cross" ]; then
+  require_cmd go "macOS 本机编译需要已安装的 Go。"
+  [ -x "$ZIG_BIN" ] || die "macOS 本机交叉编译需要 Zig。请安装 Zig（brew install zig），或设置 ZIG_BIN=/path/to/zig。"
+  title "在 macOS 本机交叉编译 Linux/amd64（CGO 使用 Zig）"
+  if (
+    cd "$SRC_DIR"
+    env CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
+      CC="$ZIG_BIN cc -target x86_64-linux-gnu" \
+      GOFLAGS=-mod=mod go build -o main .
+  ); then
+    file "$SRC_DIR/main" | grep -q 'ELF 64-bit LSB.*x86-64' \
+      || die "交叉编译产物不是 Linux/amd64 ELF。"
+  else
+    die "macOS 本机交叉编译失败。请检查 Go、Zig 与网络依赖。"
+  fi
+elif [ "$BUILD_MODE" = "docker" ]; then
+  title "容器内编译（首次会拉取大量 Go 依赖）"
+  docker run --platform "$DOCKER_PLATFORM" --rm \
+    -v "$SRC_DIR":/src \
+    -w /src \
+    -e GOFLAGS=-mod=mod \
+    "$BUILDER_IMAGE" \
+    bash -lc 'export PATH=/usr/local/go/bin:$PATH && go build -o main . ' \
+    || die "编译失败。请检查上面的 Go 报错信息。"
+else
+  die "未知 BUILD_MODE=$BUILD_MODE（可用 auto、host-cross、docker）。"
+fi
 
-[ -x "$SRC_DIR/main" ] || die "编译结束但未生成 main 可执行文件。"
+if [ "$BUILD_MODE" != "host-cross" ] && [ "$(uname -s)" = "Darwin" ] \
+  && [ "$(docker info --format '{{.OSType}}/{{.Architecture}}' 2>/dev/null || true)" = "linux/arm64" ]; then
+  file "$SRC_DIR/main" | grep -q 'ELF 64-bit LSB.*x86-64' \
+    || die "容器编译产物不是 Linux/amd64 ELF。"
+fi
+
+if [ ! -x "$SRC_DIR/main" ]; then
+  die "编译结束但未生成可执行文件 $SRC_DIR/main。"
+fi
 
 title "验证版本号是否真的写进二进制"
 python3 - "$SRC_DIR/main" "$WECHAT_VER" <<'PY' || true

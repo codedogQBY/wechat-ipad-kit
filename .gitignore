@@ -2,6 +2,7 @@
 .state/
 bot/data/*.json
 wechat860-src/
+wechat860-src-macos-sed-test/
 *.log
 *.zip
 *.tar.xz

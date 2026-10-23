@@ -124,7 +124,7 @@ WECHAT_VER=0x18005620 bash run.sh --from 3
 
 ## 斗地主机器人
 
-`bot/` 将 `doudizhu-master` 的斗地主规则接入当前 iPad 协议服务：复用已登录会话，通过本机 HTTP API 同步群消息和发送文本，不会再创建 Wechaty 登录或 Docker 容器。
+`bot/` 将 `doudizhu-master` 的斗地主规则接入当前 iPad 协议服务：复用已登录会话，通过本机 HTTP API 同步群消息和发送文本，不会再创建 Wechaty 登录或 Docker 容器。启动时会调用 `Login/AutoHeartBeat`，让协议服务维护心跳并按需执行二次登录。
 
 启动前确认 `bash scripts/05-verify.sh` 显示已登录，然后将输出的 Wxid 设置给机器人：
 

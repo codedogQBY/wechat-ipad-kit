@@ -88,6 +88,21 @@ sed -E \
 mv "$SRC_DIR/baseinfo/basedefine.go.tmp" "$SRC_DIR/baseinfo/basedefine.go"
 ok "baseinfo/basedefine.go"
 
+# The upstream source currently hard-codes the newsync request as iPhone.
+# Keep it aligned with the device type used during login (normally iPad),
+# otherwise polling can look like a second client and invalidate the session.
+sync_file="$SRC_DIR/models/Msg/sync.go"
+if [ -f "$sync_file" ]; then
+  if grep -q 'DeviceType:[[:space:]]*proto.String("iPhone")' "$sync_file"; then
+    sed_in_place 's|DeviceType:[[:space:]]*proto.String("iPhone"),|DeviceType:    proto.String(D.DeviceType),|' "$sync_file"
+    ok "同步请求设备类型已对齐登录设备"
+  elif grep -q 'DeviceType:[[:space:]]*proto.String(D.DeviceType)' "$sync_file"; then
+    ok "同步请求设备类型已对齐登录设备"
+  else
+    warn "未识别 models/Msg/sync.go 的设备类型字段，保留上游实现"
+  fi
+fi
+
 title "当前版本号定义"
 grep -nE "IPadVersion = |IPadVersionx = " "$SRC_DIR/Algorithm/Util.go" || true
 grep -nE "ClientVersion = uint32" "$SRC_DIR/baseinfo/basedefine.go" || true

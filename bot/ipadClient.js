@@ -68,6 +68,10 @@ class IpadClient {
     return result.Data?.AddMsgs || result.Data?.addMsgs || [];
   }
 
+  async enableAutoHeartbeat() {
+    return this.post("/Login/AutoHeartBeat", {}, { wxid: this.wxid });
+  }
+
   async sendText(toWxid, content) {
     const result = await this.post("/Msg/SendTxt", {
       Wxid: this.wxid,

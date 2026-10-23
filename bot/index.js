@@ -143,6 +143,8 @@ async function poll() {
 async function main() {
   const self = await client.getSelf();
   botName ||= self.NickName || self.Nickname || "";
+  await client.enableAutoHeartbeat();
+  console.log("协议自动心跳已开启");
   registerDouCommand();
   console.log(`斗地主机器人已连接: ${botName || wxid} (${wxid})`);
   console.log(`API: ${client.baseUrl}/${client.prefix}`);
